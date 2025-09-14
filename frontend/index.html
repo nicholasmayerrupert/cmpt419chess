@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Chess Review UI</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+      .app {
+        min-height: 100dvh;
+        display: grid;
+        grid-template-rows: auto 1fr;
+        background: #0b1020;
+        color: #e6e6e6;
+      }
+      header {
+        display:flex; align-items:center; justify-content:space-between;
+        padding: 12px 16px; background: #12172a; border-bottom: 1px solid #2a2f45;
+      }
+      header h1 { margin: 0; font-size: 16px; letter-spacing: .3px; }
+     .container {
+        display: grid;
+        /* wider left column so the board + eval bar fit cleanly */
+        grid-template-columns: 640px 1fr;
+        gap: 16px; padding: 16px;
+      }
+
+      /* responsive fallback */
+      @media (max-width: 1100px) {
+        .container {
+          grid-template-columns: 1fr;
+        }
+      }
+      .panel {
+        background:#12172a; border:1px solid #2a2f45; border-radius: 14px; padding: 12px;
+        box-shadow: 0 6px 24px rgba(0,0,0,0.25);
+      }
+      .controls { display:flex; gap:8px; flex-wrap: wrap; }
+      button {
+        border:1px solid #3a415f; background:#1a2040; color:#e6e6e6;
+        padding:8px 12px; border-radius:10px; cursor:pointer;
+      }
+      button:hover { background:#232a54; }
+      .status { font-size: 12px; opacity:.85; }
+      .fen {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        font-size:12px; word-break: break-all; background:#0e1430;
+        padding:8px; border-radius:8px; border:1px solid #2a2f45;
+      }
+      .history { display:flex; flex-wrap: wrap; gap:6px; font-size: 12px; }
+      .pill {
+        padding:4px 8px; border-radius:999px; background:#1a2140; border:1px solid #2a2f45;
+      }
+      .error { color:#ff8a8a; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
