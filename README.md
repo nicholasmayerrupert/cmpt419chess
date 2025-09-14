@@ -1,6 +1,5 @@
 # Chess Review MVP: React UI + FastAPI backend
 
-This starter lets you move pieces on a React board and have the Python backend own the game state.
 
 ## Backend (FastAPI)
 ```bash
@@ -10,17 +9,9 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
+
 ```bash
-#Windows
-npm install -D @vitejs/plugin-react
-
-npm install
-
-npm run dev
-
-```
-```bash
-#Engine start
+#Engine start, not always needed
 curl "http://localhost:8000/eval?depth=14"
 
 ```
