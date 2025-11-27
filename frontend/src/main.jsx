@@ -163,6 +163,15 @@ function App() {
     const s = localStorage.getItem('engineEnabled')
     return s === null ? true : s === 'true'
   })
+  const [chatMessages, setChatMessages] = useState([])
+  const [chatInput, setChatInput] = useState('')
+  const [coachLoading, setCoachLoading] = useState(false)
+  const [coachError, setCoachError] = useState(null)
+  const chatEndRef = useRef(null)
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [chatMessages])
 
   const BOARD_PX = 560
   const position = useMemo(() => state?.fen ?? undefined, [state])
@@ -182,6 +191,8 @@ function App() {
 
   const evalAbortRef = useRef(null)
   const evalReqIdRef = useRef(0)
+  const coachReqIdRef = useRef(0)
+  const AUTO_PROMPT = "Give a concise update on the plans, threats, and best moves after that last move."
 
   // Warm engine
   useEffect(() => {
@@ -219,6 +230,8 @@ function App() {
     const id = setInterval(() => fetchEval(depth, 'refresh'), 8000)
     return () => clearInterval(id)
   }, [engineEnabled, depth, state?.fen])
+
+
 
   const styleSelected = {
     outline: '3px solid rgba(255, 223, 88, 0.9)',
@@ -279,7 +292,10 @@ function App() {
       }
       if (!isLegalUci(uci)) return
       const ok = await makeMove(uci)
-      if (ok) { setSelectedSquare(null); setMoveSquares({}) }
+      if (ok) {
+        setSelectedSquare(null); setMoveSquares({})
+        triggerAutoCoach()
+      }
       return
     }
 
@@ -318,6 +334,7 @@ function App() {
 
     const ok = await makeMove(uci)
     setSelectedSquare(null); setMoveSquares({})
+    if (ok) triggerAutoCoach()
     return ok
   }
 
@@ -353,10 +370,83 @@ function App() {
     }
   }
 
+  const requestCoachAnalysis = async (prompt, { clearInput = false, prefix = '' } = {}) => {
+    const trimmed = (prompt || '').trim()
+    if (!trimmed) return
+
+    if (clearInput) setChatInput('')
+    setCoachLoading(true)
+    setCoachError(null)
+
+    const displayContent = prefix ? `${prefix}${trimmed}` : trimmed
+    const userMsg = { role: 'user', content: displayContent }
+    const assistantPlaceholder = { role: 'assistant', content: '' }
+
+    let payloadHistory = []
+    setChatMessages(prev => {
+      payloadHistory = [...prev, userMsg].map(m => ({ role: m.role, content: m.content }))
+      return [...prev, userMsg, assistantPlaceholder]
+    })
+
+    const payload = { question: trimmed, history: payloadHistory }
+    const reqId = ++coachReqIdRef.current
+
+    try {
+      const res = await fetch(`${API}/coach/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+
+      if (!res.ok) throw new Error(res.statusText || 'Request failed')
+      if (!res.body) throw new Error('No response body')
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let done = false
+
+      while (!done) {
+        const { value, done: doneReading } = await reader.read()
+        done = doneReading
+        if (!value) continue
+        const chunk = decoder.decode(value, { stream: true })
+
+        if (reqId !== coachReqIdRef.current) return
+
+        setChatMessages(prev => {
+          const last = prev[prev.length - 1]
+          if (!last || last.role !== 'assistant') return prev
+          const updatedMsg = { ...last, content: last.content + chunk }
+          return [...prev.slice(0, -1), updatedMsg]
+        })
+      }
+    } catch (e) {
+      if (reqId === coachReqIdRef.current) setCoachError(String(e?.message || e))
+      setChatMessages(prev => {
+        const last = prev[prev.length - 1]
+        if (last?.role === 'assistant' && !last.content) {
+          return prev.slice(0, -1)
+        }
+        return prev
+      })
+    } finally {
+      if (reqId === coachReqIdRef.current) setCoachLoading(false)
+    }
+  }
+
+  const sendChat = async () => {
+    await requestCoachAnalysis(chatInput, { clearInput: true })
+  }
+
+  const triggerAutoCoach = () => {
+    if (coachLoading) return
+    requestCoachAnalysis(AUTO_PROMPT, { prefix: 'Auto · ' })
+  }
+
   if (!state) {
     return (
       <div className="app">
-        <header><h1>Chess Review UI</h1></header>
+        <header><h1>Chess Review</h1></header>
         <div className="container">
           <div className="panel">Loading…</div>
         </div>
@@ -367,7 +457,7 @@ function App() {
   return (
     <div className="app">
       <header>
-        <h1>Chess Review UI</h1>
+        <h1>Chess!</h1>
         <div className="controls" style={{alignItems:'center', gap:12}}>
           <button onClick={flipBoard}>Flip Board</button>
           <button onClick={newGame}>New Game</button>
@@ -420,34 +510,89 @@ function App() {
           />
         </div>
 
-        <div className="panel" style={{display:'grid', gap: '12px'}}>
-          <div className="status">
-            <div><strong>Turn:</strong> {state.turn === 'w' ? 'White' : 'Black'}</div>
-            {state.is_game_over ? <div>Game over — result: {state.result}</div> : null}
-            {evalData?.bestmove?.san && <div><strong>Best:</strong> {evalData.bestmove.san}</div>}
-            {evalData?.pv?.san && evalData.pv.san?.length > 0 && (
-              <div style={{fontSize:12, opacity:.9}}>
-                <strong>PV:</strong> {evalData.pv.san.slice(0,8).join(' ')}
+        <div style={{display:'flex', flexDirection:'column', gap:16, minWidth:0}}>
+          <div className="panel" style={{display:'grid', gap: '12px'}}>
+            <div className="status">
+              <div><strong>Turn:</strong> {state.turn === 'w' ? 'White' : 'Black'}</div>
+              {state.is_game_over ? <div>Game over — result: {state.result}</div> : null}
+              {evalData?.bestmove?.san && <div><strong>Best Move:</strong> {evalData.bestmove.san}</div>}
+              {evalData?.pv?.san && evalData.pv.san?.length > 0 && (
+                <div style={{fontSize:12, opacity:.9}}>
+                  <strong>Best Line:</strong> {evalData.pv.san.slice(0,8).join(' ')}
+                </div>
+              )}
+              <div style={{fontSize:12, opacity:.8}}>
+                {evalData?.engine_type ? <>Engine: {evalData.engine_type} · </> : null}
+                {evalData?.depth ? <>Depth: {evalData.depth} · </> : null}
+                {typeof evalData?.elapsed_ms === 'number' ? <>Time: {evalData.elapsed_ms} ms</> : null}
+                {evalData?.pending ? <> · analysing…</> : null}
               </div>
-            )}
-            <div style={{fontSize:12, opacity:.8}}>
-              {evalData?.engine_type ? <>Engine: {evalData.engine_type} · </> : null}
-              {evalData?.depth ? <>Depth: {evalData.depth} · </> : null}
-              {typeof evalData?.elapsed_ms === 'number' ? <>Time: {evalData.elapsed_ms} ms</> : null}
-              {evalData?.pending ? <> · analysing…</> : null}
+              {error && <div className="error">{String(error)}</div>}
+              {lastEvalError && <div className="error" style={{marginTop:8}}>Eval error: {lastEvalError}</div>}
             </div>
-            {error && <div className="error">{String(error)}</div>}
-            {lastEvalError && <div className="error" style={{marginTop:8}}>Eval error: {lastEvalError}</div>}
+
+            <div>
+              <div style={{marginBottom: 6, fontWeight:600}}>FEN</div>
+              <div className="fen">{state.fen}</div>
+            </div>
+            <div>
+              <div style={{marginBottom: 6, fontWeight:600}}>Moves (SAN)</div>
+              <div className="history">
+                {state.history_san.map((m, i) => <span key={i} className="pill">{m}</span>)}
+              </div>
+            </div>
           </div>
 
-          <div>
-            <div style={{marginBottom: 6, fontWeight:600}}>FEN</div>
-            <div className="fen">{state.fen}</div>
-          </div>
-          <div>
-            <div style={{marginBottom: 6, fontWeight:600}}>Moves (SAN)</div>
-            <div className="history">
-              {state.history_san.map((m, i) => <span key={i} className="pill">{m}</span>)}
+          <div className="panel" style={{display:'flex', flexDirection:'column', gap:12, flexGrow:1, minHeight:400}}>
+            <div style={{flexShrink:0}}>
+              <div style={{fontWeight:600}}>Chess Coach</div>
+              <div style={{fontSize:12, opacity:.8}}>Chat with the model about the position.</div>
+            </div>
+            
+            <div style={{flexGrow:1, overflowY:'auto', display:'flex', flexDirection:'column', gap:8, paddingRight:4, maxHeight: 500}}>
+              {chatMessages.length === 0 && (
+                <div style={{fontSize:13, opacity:0.6, fontStyle:'italic', marginTop:20, textAlign:'center'}}>
+                  Ask a question to start the conversation...
+                </div>
+              )}
+              {chatMessages.map((m, i) => (
+                <div key={i} style={{
+                  alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',
+                  background: m.role === 'user' ? '#355070' : '#2a2f45',
+                  color: '#e6e6e6',
+                  padding: '8px 12px',
+                  borderRadius: 8,
+                  maxWidth: '90%',
+                  fontSize: 14,
+                  lineHeight: 1.4,
+                  whiteSpace: 'pre-wrap'
+                }}>
+                  {m.content}
+                </div>
+              ))}
+              {coachLoading && (
+                <div style={{alignSelf:'flex-start', background:'#2a2f45', color:'#aaa', padding:'6px 10px', borderRadius:6, fontSize:12, fontStyle:'italic'}}>
+                  Typing...
+                </div>
+              )}
+              {coachError && (
+                <div style={{alignSelf:'center', color:'#ff8a8a', fontSize:12, background:'#3d1a1a', padding:6, borderRadius:4}}>
+                  Error: {coachError}
+                </div>
+              )}
+              <div ref={chatEndRef} />
+            </div>
+
+            <div style={{display:'flex', gap:6, flexShrink:0}}>
+              <input
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && sendChat()}
+                placeholder="Ask a question..."
+                style={{flexGrow:1, padding:8, borderRadius:6, border:'1px solid #3a415f', background:'#0e1430', color:'inherit'}}
+                disabled={coachLoading}
+              />
+              <button onClick={sendChat} disabled={coachLoading || !chatInput.trim()}>Send</button>
             </div>
           </div>
         </div>
