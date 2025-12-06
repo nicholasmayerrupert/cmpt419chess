@@ -1,0 +1,6 @@
+﻿backend/.env
+backend/.env.local
+backend/.venv/
+frontend/dist/
+__pycache__/
+*.pyc
