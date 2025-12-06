@@ -4,7 +4,7 @@ import { Chessboard } from 'react-chessboard'
 
 const API = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
 
-/* ---------------- Backend bridge ---------------- */
+// backend bridge
 
 function useChessState() {
   const [state, setState] = useState(null)
@@ -74,7 +74,7 @@ function useChessState() {
   return { state, error, newGame, undo, redo, makeMove, setState, fetchState }
 }
 
-/* ---------------- Eval helpers/bar (unchanged from your good version) ---------------- */
+// eval helpers
 
 function clampCp(cp) { const v = Number(cp ?? 0); return Math.max(-800, Math.min(800, v)) }
 function cpToPct(cpBottom) { const cpC = clampCp(cpBottom); return 1 / (1 + Math.pow(10, -cpC / 400)) }
@@ -130,7 +130,7 @@ function EvalBar({ evalData, height = 560, durationMs = 400, orientation = 'whit
   )
 }
 
-/* ---------------- Utilities ---------------- */
+// util bits
 
 function useDebouncedCallback(cb, delayMs) {
   const timer = useRef(null)
@@ -142,16 +142,17 @@ function useDebouncedCallback(cb, delayMs) {
 const LIGHT = '#B7C6D9'
 const DARK  = '#355070'
 
-/* ---------------- App ---------------- */
+// app shell
 
 function App() {
   const { state, error, newGame, undo, redo, makeMove } = useChessState()
+  const boardPanelRef = useRef(null)
 
-  // click-to-move & highlights
+  // move selection
   const [selectedSquare, setSelectedSquare] = useState(null)
   const [moveSquares, setMoveSquares] = useState({})
 
-  // eval stuff
+  // eval state
   const [evalData, setEvalData] = useState(null)
   const [lastEvalError, setLastEvalError] = useState(null)
 
@@ -173,7 +174,45 @@ function App() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chatMessages])
 
-  const BOARD_PX = 560
+  const [boardWidth, setBoardWidth] = useState(640)
+  const EVAL_BAR_RESERVE = 56
+  const BOARD_GAP = 16
+  const VERTICAL_SAFE_MARGIN = 220
+
+  useEffect(() => {
+    if (!state) return
+    const panelEl = boardPanelRef.current
+    if (!panelEl) return
+
+    const updateBoardWidth = () => {
+      const totalWidth = panelEl.clientWidth || 0
+      if (!totalWidth) return
+      const available = Math.max(0, totalWidth - (EVAL_BAR_RESERVE + BOARD_GAP))
+      const heightLimit = typeof window !== 'undefined'
+        ? Math.max(320, window.innerHeight - VERTICAL_SAFE_MARGIN)
+        : Infinity
+      const nextWidth = Math.round(Math.min(available, heightLimit))
+      setBoardWidth(prev => (prev === nextWidth || nextWidth <= 0 ? prev : nextWidth))
+    }
+
+    updateBoardWidth()
+
+    let observer = null
+    if (typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(updateBoardWidth)
+      observer.observe(panelEl)
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('resize', updateBoardWidth)
+    }
+
+    return () => {
+      if (observer) observer.disconnect()
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('resize', updateBoardWidth)
+      }
+    }
+  }, [Boolean(state)])
   const position = useMemo(() => state?.fen ?? undefined, [state])
 
   const [orientation, setOrientation] = useState(() => {
@@ -194,7 +233,7 @@ function App() {
   const coachReqIdRef = useRef(0)
   const AUTO_PROMPT = "Give a concise update on the plans, threats, and best moves after that last move."
 
-  // Warm engine
+  // warm engine
   useEffect(() => {
     if (!engineEnabled) return
     ;(async () => {
@@ -205,7 +244,7 @@ function App() {
     })()
   }, [engineEnabled])
 
-  // On FEN change: mark pending, keep old score
+  // on fen change keep old score
   useEffect(() => {
     setSelectedSquare(null); setMoveSquares({})
     if (engineEnabled) {
@@ -216,7 +255,7 @@ function App() {
     }
   }, [state?.fen, engineEnabled])
 
-  // Debounced eval on depth changes
+  // debounced eval on depth changes
   const debouncedEval = useDebouncedCallback((d) => {
     if (engineEnabled) {
       setEvalData(ed => ed ? { ...ed, pending: true } : ed)
@@ -265,7 +304,7 @@ function App() {
   const isLegalUci = (uci) => !!state?.legal_moves?.includes(uci)
   const hasPromotion = (prefix) => state?.legal_moves?.some(m => m.startsWith(prefix) && m.length === 5)
 
-  /* ---------- Click-to-move ---------- */
+  // click-to-move
 
   const onSquareClick = async (square) => {
     if (!selectedSquare) {
@@ -308,7 +347,7 @@ function App() {
     }
   }
 
-  /* ---------- Drag & drop ---------- */
+  // drag + drop
 
   const onPieceDragBegin = (_piece, sourceSquare) => {
     const targets = computeMoveSquares(sourceSquare)
@@ -338,7 +377,7 @@ function App() {
     return ok
   }
 
-  /* ---------- Eval fetch ---------- */
+  // eval fetch
 
   const fetchEval = async (d = depth, _reason = '') => {
     try {
@@ -491,23 +530,28 @@ function App() {
       </header>
 
       <div className="container">
-        <div className="panel" style={{display:'flex', gap:16, alignItems:'center', justifyContent:'center', position:'relative', width: 560 + 56 }}>
-          <EvalBar evalData={evalData} height={560} orientation={orientation}/>
-          <Chessboard
-            id="board"
-            position={position}
-            boardOrientation={orientation}
-            arePiecesDraggable={true}
-            animationDuration={200}
-            onPieceDrop={onPieceDrop}
-            onSquareClick={onSquareClick}
-            onPieceDragBegin={onPieceDragBegin}
-            onPieceDragEnd={onPieceDragEnd}
-            customSquareStyles={moveSquares}
-            boardWidth={560}
-            customDarkSquareStyle={{ backgroundColor: DARK }}
-            customLightSquareStyle={{ backgroundColor: LIGHT }}
-          />
+        <div className="panel" style={{minWidth:0}}>
+          <div
+            ref={boardPanelRef}
+            style={{display:'flex', gap:BOARD_GAP, alignItems:'center', justifyContent:'center', width:'100%', minWidth:0}}
+          >
+            <EvalBar evalData={evalData} height={boardWidth} orientation={orientation}/>
+            <Chessboard
+              id="board"
+              position={position}
+              boardOrientation={orientation}
+              arePiecesDraggable={true}
+              animationDuration={200}
+              onPieceDrop={onPieceDrop}
+              onSquareClick={onSquareClick}
+              onPieceDragBegin={onPieceDragBegin}
+              onPieceDragEnd={onPieceDragEnd}
+              customSquareStyles={moveSquares}
+              boardWidth={boardWidth}
+              customDarkSquareStyle={{ backgroundColor: DARK }}
+              customLightSquareStyle={{ backgroundColor: LIGHT }}
+            />
+          </div>
         </div>
 
         <div style={{display:'flex', flexDirection:'column', gap:16, minWidth:0}}>

@@ -1,11 +1,11 @@
-# main.py
 import os
 import sys
 import time
 import uuid
 import asyncio
 import logging
-from typing import Optional, Dict, Any, List, AsyncGenerator
+import threading
+from typing import Optional, Dict, Any, List, AsyncGenerator, Tuple
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,22 +18,34 @@ try:
     from llama_cpp import Llama
 except Exception:  # ImportError or GPU init issues
     Llama = None  # type: ignore
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None  # type: ignore
 
-# ----------------------------- Windows event loop (for subprocess on Windows) -----------------------------
+# windows event loop (for subprocess on windows)
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-# ----------------------------- Env & logging -----------------------------
+# env & logging
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# Reduce python-chess engine noise like "Unexpected engine output"
+# reduce python-chess engine noise like "unexpected engine output"
 logging.getLogger("chess.engine").setLevel(logging.ERROR)
+COACH_LOGGER = logging.getLogger("coach")
+COACH_LOGGER.setLevel(logging.INFO)
+if not COACH_LOGGER.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    formatter = logging.Formatter("[%(asctime)s] %(levelname)s coach: %(message)s")
+    handler.setFormatter(formatter)
+    COACH_LOGGER.addHandler(handler)
 
-# ----------------------------- Config -----------------------------
+# config
 APP_TITLE = "Chess Review Backend"
 APP_DESC = "Board state, undo/redo, engine evaluation (Stockfish), ply-safe moves."
 
@@ -50,9 +62,12 @@ LLM_CTX_TOKENS = int(os.getenv("LLM_CTX_TOKENS", "4096"))
 LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "512"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.6"))
 LLM_EAGER_START = os.getenv("LLM_EAGER_START", "0") == "1"
+COACH_PROVIDER = os.getenv("COACH_PROVIDER", "local").strip().lower()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENINGS_TSV_PATH = os.path.join(os.path.dirname(__file__), "data", "chess_openings.tsv")
 
-# ----------------------------- App & CORS -----------------------------
+# app & cors
 app = FastAPI(title=APP_TITLE, description=APP_DESC)
 
 app.add_middleware(
@@ -63,15 +78,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------- Global board state -----------------------------
+# global board state
 board = chess.Board()
 redo_stack: List[chess.Move] = []
 OPENINGS_BY_EPD: Dict[str, Dict[str, str]] = {}
 
-# Serialize game mutations/reads
+# serialize game mutations/reads
 BOARD_LOCK = asyncio.Lock()
 
-# Idempotency for /move
+# idempotency for /move
 PROCESSED_REQ_IDS: Dict[str, float] = {}
 PROCESSED_REQ_IDS_LIMIT = 200
 
@@ -99,7 +114,7 @@ def _history_san() -> List[str]:
             out.append(tmp.san(mv))
             tmp.push(mv)
         except Exception:
-            # Failsafe: append UCI, still try to push to keep sequence aligned
+            # failsafe: append uci, still try to push to keep sequence aligned
             out.append(mv.uci())
             try:
                 tmp.push(mv)
@@ -194,7 +209,7 @@ def _detect_opening_from_moves(moves: List[chess.Move]) -> Optional[Dict[str, st
 _load_openings_database()
 
 
-# ----------------------------- Engine manager -----------------------------
+# engine manager
 class EngineManager:
     def __init__(self, path: str, threads: int = 8, hash_mb: int = 256):
         self.path = os.path.abspath(path)
@@ -228,7 +243,7 @@ class EngineManager:
         Start the engine if needed. If already started, ping it; if ping fails,
         fully restart. On success, clears self.engine_error; on failure, sets it.
         """
-        # If we think it's running, verify with a ping
+        # if we think it's running, verify with a ping
         if self.engine is not None:
             try:
                 await asyncio.to_thread(self.engine.ping)
@@ -240,7 +255,7 @@ class EngineManager:
             self.engine_error = f"Engine not found at path: {self.path}"
             return
 
-        # Start the engine in a worker thread (reliable on Windows / Py3.12)
+        # start the engine in a worker thread (reliable on windows / py3.12)
         try:
             self.engine = await asyncio.to_thread(chess.engine.SimpleEngine.popen_uci, self.path)
         except Exception as e:
@@ -248,14 +263,14 @@ class EngineManager:
             self.engine_error = f"popen_uci failed: {type(e).__name__}: {e}"
             return
 
-        # Configure (best-effort)
+        # configure (best-effort)
         try:
             self.engine.configure({"Threads": self.threads, "Hash": self.hash_mb})
         except Exception as e:
-            # Not fatal; keep a note
+            # not fatal; keep a note
             self.engine_error = f"configure warning: {type(e).__name__}: {e}"
 
-        # Ping/handshake
+        # ping/handshake
         try:
             await asyncio.to_thread(self.engine.ping)
         except Exception as e:
@@ -263,7 +278,7 @@ class EngineManager:
             self.engine_error = f"ping failed: {type(e).__name__}: {e}"
             return
 
-        # Light probe to ensure analyse/GO works
+        # light probe to ensure analyse/go works
         try:
             start_b = chess.Board(chess.STARTING_FEN)
             await asyncio.to_thread(self.engine.analyse, start_b, chess.engine.Limit(depth=1))
@@ -272,7 +287,7 @@ class EngineManager:
             self.engine_error = f"probe failed: {type(e).__name__}: {e}"
             return
 
-        # If we reach here, engine is up; clear any previous error note.
+        # if we reach here, engine is up; clear any previous error note.
         self.engine_error = ""
 
     async def analyse_fen(self, fen: str, depth: int = 12) -> Dict[str, Any]:
@@ -289,10 +304,10 @@ class EngineManager:
             result = await asyncio.to_thread(self.engine.analyse, b, limit, multipv=1)
             elapsed = int((time.time() - t0) * 1000)
 
-        # python-chess returns InfoDict or List[InfoDict] when multipv is set
+        # python-chess returns infodict or list[infodict] when multipv is set
         info = result[0] if isinstance(result, list) and result else (result or {})
 
-        # Score (White POV)
+        # score (white pov)
         score_json: Dict[str, Any] = {}
         score_obj = info.get("score")
         if score_obj is not None:
@@ -302,7 +317,7 @@ class EngineManager:
             else:
                 score_json["cp"] = pov.score()
 
-        # PV / best move
+        # pv / best move
         pv_moves: List[chess.Move] = list(info.get("pv") or [])
         bestmove_uci = pv_moves[0].uci() if pv_moves else None
         bestmove_san = chess.Board(fen).san(pv_moves[0]) if pv_moves else None
@@ -339,6 +354,140 @@ class EngineManager:
 
 engine = EngineManager(STOCKFISH_PATH, ENGINE_THREADS, ENGINE_HASH_MB)
 
+
+def _normalize_chat_history(history: Optional[List[Dict[str, str]]]) -> List[Dict[str, str]]:
+    """
+    llama-cpp and OpenAI both prefer alternating user/assistant roles after any optional system prompt.
+    Filter malformed entries, enforce alternation starting with a user turn, and drop a trailing user entry.
+    """
+    if not history:
+        return []
+
+    normalized: List[Dict[str, str]] = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        role_raw = item.get("role")
+        content_raw = item.get("content")
+        if not isinstance(role_raw, str) or not isinstance(content_raw, str):
+            continue
+        role = role_raw.strip().lower()
+        content = content_raw.strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        if not normalized:
+            if role != "user":
+                continue
+        else:
+            if normalized[-1]["role"] == role:
+                continue
+        normalized.append({"role": role, "content": content})
+
+    if normalized and normalized[-1]["role"] == "user":
+        normalized.pop()
+
+    return normalized
+
+
+def _summarize_engine_eval(engine_eval: Optional[Dict[str, Any]]) -> str:
+    """
+    Turn the latest Stockfish evaluation into a short human-readable summary.
+    """
+    if not engine_eval:
+        return "Engine evaluation unavailable."
+
+    error = engine_eval.get("error")
+    if error:
+        return f"Engine evaluation unavailable ({error})."
+
+    score = engine_eval.get("score") or {}
+    mate = score.get("mate")
+    cp = score.get("cp")
+
+    score_text: str
+    if mate is not None:
+        try:
+            mate_val = int(mate)
+        except (TypeError, ValueError):
+            mate_val = 0
+        pov = "White" if mate_val > 0 else "Black"
+        score_text = f"mate in {abs(mate_val)} for {pov}"
+    elif cp is not None:
+        try:
+            cp_val = float(cp)
+        except (TypeError, ValueError):
+            cp_val = 0.0
+        pov = "White" if cp_val >= 0 else "Black"
+        score_text = f"{abs(cp_val) / 100:.2f} pawns for {pov}"
+    else:
+        score_text = "no numeric score"
+
+    bestmove = engine_eval.get("bestmove") or {}
+    bestmove_text = bestmove.get("san") or bestmove.get("uci") or "n/a"
+
+    pv_san = (engine_eval.get("pv") or {}).get("san") or []
+    pv_text = " ".join(pv_san[:6]) if pv_san else "n/a"
+
+    depth = engine_eval.get("depth")
+    if isinstance(depth, int):
+        depth_text = f"depth {depth}"
+    else:
+        depth_text = "unknown depth"
+
+    return f"Score: {score_text}. Preferred move: {bestmove_text}. Search {depth_text}. PV: {pv_text}."
+
+
+def _summarize_opening(opening_info: Optional[Dict[str, str]]) -> str:
+    if not opening_info:
+        return "Opening unknown or not listed in the reference."
+    name = opening_info.get("name", "Unknown opening")
+    line = opening_info.get("pgn") or "N/A"
+    return f"{name}. Reference line: {line}."
+
+
+def _build_coach_prompts(
+    fen: str,
+    history_san: List[str],
+    side_to_move: str,
+    question: Optional[str],
+    chat_history: Optional[List[Dict[str, str]]],
+    engine_eval: Optional[Dict[str, Any]],
+    opening_info: Optional[Dict[str, str]],
+) -> Tuple[str, str, List[Dict[str, str]]]:
+    history_tail = history_san[-24:]
+    base_question = (question or "").strip()[:400]
+    if not base_question:
+        base_question = (
+            "Give a short, beginner-friendly explanation of the plans, "
+            "threats, and simple tactics that both sides should look for."
+        )
+    board_ascii = str(chess.Board(fen))
+    history_text = ", ".join(history_tail) if history_tail else "No moves played yet."
+
+    engine_summary = _summarize_engine_eval(engine_eval)
+    opening_summary = _summarize_opening(opening_info)
+
+    system_prompt = (
+        "You are 'Coach Bot', a friendly chess tutor. "
+        "Explain moves clearly, highlight the most urgent threats, describe why key squares matter, "
+        "and suggest candidate moves for the side to move. Avoid overwhelming jargon. "
+        "Answer briefly, summaring board state, best moves, and so on. "
+    )
+
+    user_prompt = (
+        f"Current FEN: {fen}\n"
+        f"Side to move: {side_to_move}\n"
+        f"Move list (SAN): {history_text}\n"
+        f"ASCII board:\n{board_ascii}\n\n"
+        f"Opening insight: {opening_summary}\n"
+        f"Stockfish evaluation summary: {engine_summary}\n"
+        f"Instruction: {base_question}\n"
+    )
+
+    sanitized_history = _normalize_chat_history(chat_history)
+    return system_prompt, user_prompt, sanitized_history
+
+
 class ChessCoachLLM:
     """
     Manages a local GGUF model through llama-cpp-python.
@@ -372,7 +521,7 @@ class ChessCoachLLM:
             return
 
         try:
-            # Load in a worker thread because llama-cpp does blocking init.
+            # load in a worker thread because llama-cpp does blocking init.
             self.model = await asyncio.to_thread(
                 Llama,
                 model_path=self.path,
@@ -385,97 +534,6 @@ class ChessCoachLLM:
         except Exception as e:
             self.model = None
             self.model_error = f"llama init failed: {type(e).__name__}: {e}"
-
-    @staticmethod
-    def _normalize_chat_history(history: Optional[List[Dict[str, str]]]) -> List[Dict[str, str]]:
-        """
-        llama-cpp enforces alternating user/assistant roles after the optional system prompt.
-        Filter malformed entries, enforce alternation starting with a user turn, and drop a trailing
-        user entry so that appending the new user prompt keeps the alternation intact.
-        """
-        if not history:
-            return []
-
-        normalized: List[Dict[str, str]] = []
-        for item in history:
-            if not isinstance(item, dict):
-                continue
-            role_raw = item.get("role")
-            content_raw = item.get("content")
-            if not isinstance(role_raw, str) or not isinstance(content_raw, str):
-                continue
-            role = role_raw.strip().lower()
-            content = content_raw.strip()
-            if role not in {"user", "assistant"} or not content:
-                continue
-            if not normalized:
-                if role != "user":
-                    continue  # conversation must start with a user message (system prompt is provided separately)
-            else:
-                if normalized[-1]["role"] == role:
-                    continue  # require alternation
-            normalized.append({"role": role, "content": content})
-
-        if normalized and normalized[-1]["role"] == "user":
-            normalized.pop()
-
-        return normalized
-
-    @staticmethod
-    def _summarize_engine_eval(engine_eval: Optional[Dict[str, Any]]) -> str:
-        """
-        Turn the latest Stockfish evaluation into a short human-readable summary.
-        """
-        if not engine_eval:
-            return "Engine evaluation unavailable."
-
-        error = engine_eval.get("error")
-        if error:
-            return f"Engine evaluation unavailable ({error})."
-
-        score = engine_eval.get("score") or {}
-        mate = score.get("mate")
-        cp = score.get("cp")
-
-        score_text: str
-        if mate is not None:
-            try:
-                mate_val = int(mate)
-            except (TypeError, ValueError):
-                mate_val = 0
-            pov = "White" if mate_val > 0 else "Black"
-            score_text = f"mate in {abs(mate_val)} for {pov}"
-        elif cp is not None:
-            try:
-                cp_val = float(cp)
-            except (TypeError, ValueError):
-                cp_val = 0.0
-            pov = "White" if cp_val >= 0 else "Black"
-            score_text = f"{abs(cp_val) / 100:.2f} pawns for {pov}"
-        else:
-            score_text = "no numeric score"
-
-        bestmove = engine_eval.get("bestmove") or {}
-        bestmove_text = bestmove.get("san") or bestmove.get("uci") or "n/a"
-
-        pv_san = (engine_eval.get("pv") or {}).get("san") or []
-        pv_text = " ".join(pv_san[:6]) if pv_san else "n/a"
-
-        depth = engine_eval.get("depth")
-        if isinstance(depth, int):
-            depth_text = f"depth {depth}"
-        else:
-            depth_text = "unknown depth"
-
-        return f"Score: {score_text}. Preferred move: {bestmove_text}. Search {depth_text}. PV: {pv_text}."
-
-    @staticmethod
-    def _summarize_opening(opening_info: Optional[Dict[str, str]]) -> str:
-        if not opening_info:
-            return "Opening unknown or not listed in the reference."
-        name = opening_info.get("name", "Unknown opening")
-        line = opening_info.get("pgn") or "N/A"
-        return f"{name}. Reference line: {line}."
 
     async def stream_analysis(
         self,
@@ -494,43 +552,22 @@ class ChessCoachLLM:
             yield f"Error: {self.model_error or 'LLM unavailable'}"
             return
 
-        history_tail = history_san[-24:]
-        base_question = (question or "").strip()[:400]
-        if not base_question:
-            base_question = (
-                "Give a short, beginner-friendly explanation of the plans, "
-                "threats, and simple tactics that both sides should look for."
-            )
-        board_ascii = str(chess.Board(fen))
-        history_text = ", ".join(history_tail) if history_tail else "No moves played yet."
-
-        engine_summary = self._summarize_engine_eval(engine_eval)
-        opening_summary = self._summarize_opening(opening_info)
-
-        system_prompt = (
-            "You are 'Coach Bot', a friendly chess tutor. "
-            "Explain moves clearly, highlight the most urgent threats, describe why key squares matter, "
-            "and suggest candidate moves for the side to move. Avoid overwhelming jargon. "
-            "Answer briefly, summaring board state, best moves, and so on. "
-        )
-
-        user_prompt = (
-            f"Current FEN: {fen}\n"
-            f"Side to move: {side_to_move}\n"
-            f"Move list (SAN): {history_text}\n"
-            f"ASCII board:\n{board_ascii}\n\n"
-            f"Opening insight: {opening_summary}\n"
-            f"Stockfish evaluation summary: {engine_summary}\n"
-            f"Instruction: {base_question}\n"
+        system_prompt, user_prompt, sanitized_history = _build_coach_prompts(
+            fen=fen,
+            history_san=history_san,
+            side_to_move=side_to_move,
+            question=question,
+            chat_history=chat_history,
+            engine_eval=engine_eval,
+            opening_info=opening_info,
         )
 
         tokens = max_tokens or self.max_output_tokens
-        sanitized_history = self._normalize_chat_history(chat_history)
 
         async with self.lock:
             try:
-                # We request a stream from llama-cpp
-                # Although llama-cpp-python releases GIL, we wrap in to_thread 
+                # we request a stream from llama-cpp
+                # although llama-cpp-python releases gil, we wrap in to_thread 
                 # to ensure the initial call doesn't block the loop.
                 stream = await asyncio.to_thread(
                     self.model.create_chat_completion,
@@ -549,19 +586,287 @@ class ChessCoachLLM:
                     content = delta.get('content', '')
                     if content:
                         yield content
-                        # Yield to event loop to allow other tasks (ping/eval) to progress
+                        # yield to event loop to allow other tasks (ping/eval) to progress
                         await asyncio.sleep(0)
 
             except Exception as e:
                 yield f"\n[Analysis failed: {type(e).__name__}: {e}]"
 
 
-coach = ChessCoachLLM(LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_MAX_OUTPUT_TOKENS, LLM_TEMPERATURE)
+class OpenAIChatCoach:
+    """
+    Uses the OpenAI Chat Completions API instead of a local llama.cpp model.
+    """
 
-# ----------------------------- Lifespan -----------------------------
+    def __init__(
+        self,
+        model_name: str,
+        max_output_tokens: int,
+        temperature: float = 0.6,
+        api_key: Optional[str] = None,
+    ):
+        self.model_label = model_name
+        self.max_output_tokens = max_output_tokens
+        self.temperature = temperature
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.client: Optional["OpenAI"] = None
+        self.model_error: str = ""
+        self.path = f"openai::{model_name}"
+        self.lock = asyncio.Lock()
+
+    def exists(self) -> bool:
+        return bool(self.api_key)
+
+    def is_ready(self) -> bool:
+        return self.client is not None
+
+    async def ensure_loaded(self) -> None:
+        if self.client is not None:
+            return
+        if OpenAI is None:
+            self.model_error = "openai package is not installed"
+            return
+        if not self.api_key:
+            self.model_error = "OPENAI_API_KEY is not set"
+            return
+        try:
+            self.client = OpenAI(api_key=self.api_key)
+            self.model_error = ""
+        except Exception as e:
+            self.client = None
+            self.model_error = f"OpenAI init failed: {type(e).__name__}: {e}"
+
+    def _use_responses_api(self) -> bool:
+        """
+        gpt-4.1 and o-series models require the Responses API.
+        """
+        name = self.model_label.lower()
+        return name.startswith(("o1-mini-2", "gpt-4.1")) 
+
+    @staticmethod
+    def _build_responses_input(
+        system_prompt: str,
+        sanitized_history: List[Dict[str, str]],
+        user_prompt: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert the conversation into the shape expected by the Responses API.
+        """
+
+        def _block(role: str, content: str) -> Dict[str, Any]:
+            ctype = "output_text" if role == "assistant" else "input_text"
+            return {"role": role, "content": [{"type": ctype, "text": content}]}
+
+        items: List[Dict[str, Any]] = [_block("system", system_prompt)]
+        for item in sanitized_history:
+            items.append(_block(item["role"], item["content"]))
+        items.append(_block("user", user_prompt))
+        return items
+
+    async def stream_analysis(
+        self,
+        fen: str,
+        history_san: List[str],
+        side_to_move: str,
+        question: Optional[str],
+        chat_history: Optional[List[Dict[str, str]]] = None,
+        max_tokens: Optional[int] = None,
+        engine_eval: Optional[Dict[str, Any]] = None,
+        opening_info: Optional[Dict[str, str]] = None,
+    ) -> AsyncGenerator[str, None]:
+
+        await self.ensure_loaded()
+        if self.client is None:
+            yield f"Error: {self.model_error or 'LLM unavailable'}"
+            return
+
+        system_prompt, user_prompt, sanitized_history = _build_coach_prompts(
+            fen=fen,
+            history_san=history_san,
+            side_to_move=side_to_move,
+            question=question,
+            chat_history=chat_history,
+            engine_eval=engine_eval,
+            opening_info=opening_info,
+        )
+        tokens = max_tokens or self.max_output_tokens
+        messages = [
+            {"role": "system", "content": system_prompt},
+            *sanitized_history,
+            {"role": "user", "content": user_prompt},
+        ]
+
+        async with self.lock:
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue[str] = asyncio.Queue()
+            finished = asyncio.Event()
+            use_responses = self._use_responses_api()
+            COACH_LOGGER.info(
+                "OpenAI coach request model=%s responses_api=%s tokens=%s history_turns=%s",
+                self.model_label,
+                use_responses,
+                tokens,
+                len(sanitized_history),
+            )
+
+            def _enqueue(text: str) -> None:
+                fut = asyncio.run_coroutine_threadsafe(queue.put(text), loop)
+                fut.result()
+
+            def _mark_finished() -> None:
+                loop.call_soon_threadsafe(finished.set)
+
+            def _worker() -> None:
+                try:
+                    if use_responses:
+                        responses_input = self._build_responses_input(
+                            system_prompt, sanitized_history, user_prompt
+                        )
+                        resp_kwargs: Dict[str, Any] = {
+                            "model": self.model_label,
+                            "max_output_tokens": tokens,
+                            "input": responses_input,
+                        }
+                        # some of the cutting-edge models (gpt-5/o-series) reject temperature;
+                        # omit it entirely in that case.
+                        if not self.model_label.lower().startswith("gpt-5"):
+                            resp_kwargs["temperature"] = self.temperature
+                        resp = self.client.responses.create(**resp_kwargs)
+                        COACH_LOGGER.info("DEBUG RESP DIR: %s", dir(resp))
+                        COACH_LOGGER.info("Responses API call complete: %s", getattr(resp, "id", "n/a"))
+                        chunks: List[str] = []
+                        extra = getattr(resp, "output_text", None)
+                        if isinstance(extra, list):
+                            chunks.extend(extra)
+                        elif isinstance(extra, str):
+                            chunks.append(extra)
+                        output = getattr(resp, "output", None)
+                        if output:
+                            for item in output:
+                                contents = getattr(item, "content", None)
+                                if not contents:
+                                    continue
+                                for content in contents:
+                                    ctype = getattr(content, "type", "")
+                                    if ctype not in {"output_text", "text", "summary_text"}:
+                                        continue
+                                    text_obj = getattr(content, "text", None)
+                                    text_val: Optional[str] = None
+                                    if isinstance(text_obj, str):
+                                        text_val = text_obj
+                                    elif hasattr(text_obj, "value"):
+                                        text_val = getattr(text_obj, "value", None)
+                                    elif isinstance(text_obj, dict):
+                                        text_val = text_obj.get("value") or text_obj.get("text")
+                                    if not text_val and hasattr(content, "summary"):
+                                        summary_obj = getattr(content, "summary")
+                                        if isinstance(summary_obj, str):
+                                            text_val = summary_obj
+                                        elif hasattr(summary_obj, "value"):
+                                            text_val = getattr(summary_obj, "value", None)
+                                        elif isinstance(summary_obj, dict):
+                                            text_val = summary_obj.get("value") or summary_obj.get("text")
+                                    if text_val:
+                                        chunks.append(text_val)
+                        if not chunks:
+                            msg = "[No output returned by OpenAI]"
+                            chunks.append(msg)
+                            COACH_LOGGER.warning("%s Raw response: %s", msg, resp)
+                        for idx, piece in enumerate(chunks):
+                            COACH_LOGGER.info("Enqueue chunk %s len=%s repr=%r", idx, len(piece), piece[:80])
+                            _enqueue(piece)
+                    else:
+                        # check if we should disable streaming for stability with reasoning models
+                        is_reasoning = self.model_label.lower().startswith(("o1", "gpt-5"))
+                        
+                        req_kwargs = {
+                            "model": self.model_label,
+                            "messages": messages,
+                        }
+
+                        if is_reasoning:
+                            # reasoning models often fail to stream or have high latency. 
+                            # we force stream=false to ensure we get a response.
+                            req_kwargs["stream"] = False
+                            req_kwargs["max_completion_tokens"] = tokens
+                        else:
+                            req_kwargs["stream"] = True
+                            req_kwargs["max_tokens"] = tokens
+                            req_kwargs["temperature"] = self.temperature
+
+                        # make the api call
+                        response = self.client.chat.completions.create(**req_kwargs)
+
+                        if is_reasoning:
+                            # non-streaming response handling
+                            # the response is a single object, not an iterator
+                            msg = response.choices[0].message
+                            content = msg.content
+                            # check for reasoning_content if available (sometimes hidden in extra_fields)
+                            # but usually just 'content' is what we want for the ui.
+                            if content:
+                                _enqueue(content)
+                            else:
+                                COACH_LOGGER.warning("Reasoning model returned no content: %s", response)
+                        else:
+                            # standard streaming for other models (gpt-4o-mini, etc)
+                            for chunk in response:
+                                try:
+                                    choice = chunk.choices[0]
+                                    delta = getattr(choice, "delta", None)
+                                except (AttributeError, IndexError):
+                                    continue
+                                
+                                if not delta:
+                                    continue
+
+                                # try to grab content or reasoning
+                                content = getattr(delta, "content", None)
+                                reasoning = getattr(delta, "reasoning_content", None)
+
+                                if reasoning:
+                                    _enqueue(reasoning)
+                                if content:
+                                    _enqueue(content)
+                                
+                except Exception as e:
+                    COACH_LOGGER.exception("OpenAI coach call failed")
+                    _enqueue(f"\n[Analysis failed: {type(e).__name__}: {e}]")
+                finally:
+                    _mark_finished()
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+            while True:
+                if finished.is_set() and queue.empty():
+                    break
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+                COACH_LOGGER.debug("Yield chunk len=%s", len(chunk))
+                yield chunk
+
+            await finished.wait()
+
+
+if COACH_PROVIDER not in {"local", "openai"}:
+    COACH_PROVIDER = "local"
+
+if COACH_PROVIDER == "openai":
+    coach = OpenAIChatCoach(
+        model_name=OPENAI_MODEL,
+        max_output_tokens=LLM_MAX_OUTPUT_TOKENS,
+        temperature=LLM_TEMPERATURE,
+        api_key=OPENAI_API_KEY,
+    )
+else:
+    coach = ChessCoachLLM(LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_MAX_OUTPUT_TOKENS, LLM_TEMPERATURE)
+
+# lifespan
 @app.on_event("startup")
 async def _on_startup():
-    # Eager-start the engine so it's ready immediately.
+    # eager-start the engine so it's ready immediately.
     await engine.ensure_started()
     if LLM_EAGER_START:
         await coach.ensure_loaded()
@@ -571,7 +876,7 @@ async def _on_startup():
 async def _on_shutdown():
     await engine.stop()
 
-# ----------------------------- Models -----------------------------
+# models
 class MoveReq(BaseModel):
     uci: str = Field(..., description="UCI move, e.g., e2e4 or e7e8q")
     ply: Optional[int] = Field(None, description="Client's expected ply (len(move_stack))")
@@ -583,7 +888,7 @@ class CoachReq(BaseModel):
     history: Optional[List[Dict[str, str]]] = Field(None, description="Previous chat history")
     max_tokens: Optional[int] = Field(None, ge=128, le=1024, description="Override response token budget")
 
-# ----------------------------- Routes: State & controls -----------------------------
+# routes: state & controls
 @app.get("/state")
 async def get_state():
     async with BOARD_LOCK:
@@ -615,7 +920,7 @@ async def redo():
             board.push(mv)
         return JSONResponse(_state_json())
 
-# ----------------------------- Routes: Engine status / eval -----------------------------
+# routes: engine status / eval
 @app.get("/engine/status")
 async def engine_status(start: int = Query(0, description="If 1, ensure engine is started")):
     if start:
@@ -643,11 +948,11 @@ async def engine_diag():
 
 @app.get("/eval")
 async def eval_position(depth: int = Query(12, ge=4, le=40)):
-    # Snapshot FEN under lock
+    # snapshot fen under lock
     async with BOARD_LOCK:
         fen = board.fen()
 
-    # Try, restart, and retry once on known engine failures (incl. NotImplementedError)
+    # try, restart, and retry once on known engine failures (incl. notimplementederror)
     for attempt in (1, 2):
         try:
             data = await engine.analyse_fen(fen, depth=depth)
@@ -661,12 +966,13 @@ async def eval_position(depth: int = Query(12, ge=4, le=40)):
         except Exception as e:
             return JSONResponse({"detail": f"Engine error: {type(e).__name__}: {e}"}, status_code=503)
 
-# ----------------------------- Routes: LLM coach -----------------------------
+# routes: llm coach
 @app.get("/coach/status")
 async def coach_status(start: int = Query(0, description="If 1, try to load the LLM coach")):
     if start:
         await coach.ensure_loaded()
     status = {
+        "provider": COACH_PROVIDER,
         "ready": coach.is_ready(),
         "error": coach.model_error,
         "path": coach.path,
@@ -694,7 +1000,7 @@ async def coach_analyze(req: CoachReq):
     except Exception as e:
         engine_eval = {"error": f"{type(e).__name__}: {e}"}
 
-    # We return a StreamingResponse that iterates over the generator
+    # we return a streamingresponse that iterates over the generator
     return StreamingResponse(
         coach.stream_analysis(
             fen=fen,
@@ -709,7 +1015,7 @@ async def coach_analyze(req: CoachReq):
         media_type="text/plain"
     )
 
-# ----------------------------- Route: Move (ply-checked, idempotent) -----------------------------
+# route: move (ply-checked, idempotent)
 @app.post("/move")
 async def move(req: MoveReq):
     """
@@ -719,7 +1025,7 @@ async def move(req: MoveReq):
     rid = req.req_id or str(uuid.uuid4())
     now = time.time()
 
-    # Fast duplicate check
+    # fast duplicate check
     if rid in PROCESSED_REQ_IDS:
         async with BOARD_LOCK:
             return JSONResponse(_state_json())
@@ -768,12 +1074,12 @@ async def move(req: MoveReq):
 
         return JSONResponse(_state_json())
 
-# ----------------------------- Root -----------------------------
+# root
 @app.get("/")
 async def root():
     return JSONResponse({"ok": True, "engine": engine.snapshot_status_fields()})
 
-# ----------------------------- Uvicorn entry -----------------------------
+# uvicorn entry
 if __name__ == "__main__":
     import uvicorn
 

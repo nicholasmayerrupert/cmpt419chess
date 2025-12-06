@@ -1,23 +1,15 @@
 import os
 
-# -------- GLOBAL ENV / COMPILATION SWITCHES --------
+# env switches
 os.environ["WANDB_DISABLED"] = "true"
-
-# Use 12 processes for datasets/Unsloth
 os.environ["HF_DATASETS_NUM_PROC"] = "12"
-
-# Keep BLAS from spawning tons of threads per process
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
-
-# 🔴 Turn OFF Unsloth’s auto-compiler
-os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"  # docs-unsloth
-
-# 🔴 Turn OFF PyTorch compile / Inductor
+os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
 os.environ["TORCH_COMPILE"] = "0"
 os.environ["TORCHINDUCTOR_DISABLE"] = "1"
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
-# ---------------------------------------------------
+
 
 from unsloth import FastLanguageModel
 import torch

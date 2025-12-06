@@ -21,8 +21,8 @@
       header h1 { margin: 0; font-size: 16px; letter-spacing: .3px; }
      .container {
         display: grid;
-        /* wider left column so the board + eval bar fit cleanly */
-        grid-template-columns: 640px 1fr;
+        /* let the chessboard column stretch more on wide screens */
+        grid-template-columns: minmax(560px, 62%) minmax(360px, 1fr);
         gap: 16px; padding: 16px;
       }
 

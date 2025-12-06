@@ -5,7 +5,7 @@ import json
 import re
 
 STUDY_IDS = [
-    # --- ENDGAMES (Essential for coaching logic) ---
+    # endgame
     "wukLYIXj", # Beginner Endgames You Must Know (NoseKnowsAll)
     "djBRTwos", # Intermediate Endgames You Must Know
     "UsqmCsgC", # Intermediate Endgames (Alternate)
@@ -15,7 +15,7 @@ STUDY_IDS = [
     "dYFcDtRq", # Pawns aren't people! (Pawn play)
     "h3ccaYFE", # Always sacrifice the exchange (Material imbalances)
 
-    # --- STRATEGY & MIDDLEGAME (The "Why" of chess) ---
+    # strategy / middlegame
     "LAV8k5kM", # Morphy Simulator (Attacking principles)
     "kNn68T8l", # Bishops | Slice through the opposition
     "KSDGZjnf", # Knights | How to dominate your opponents
@@ -27,7 +27,7 @@ STUDY_IDS = [
     "w2JcfP5K", # The Most Instructive Games of Chess Ever Played (Chernev)
     "YtBYXc3m", # Beautiful Checkmates (Pattern recognition)
 
-    # --- OPENINGS (Solid & Instructional, not traps) ---
+    # openings
     "h4GuSZh3", # English Opening Repertoire (Mr_Penings)
     "8SEqMHi5", # English Opening (Alternate)
     "ZWHbJIPd", # Nimzo/Bogo Indian Repertoire
@@ -40,7 +40,7 @@ STUDY_IDS = [
     "bmWAylqe", # Repertoire for the D4 Player
     "sEo8o4Rm", # 1. e4 Nc6 (Nimzowitsch Defense - Solid offbeat)
 
-    # --- MASTER GAMES & SPEEDRUNS (High level commentary) ---
+    # master games / speedruns
     "s6JNESzr", # Naroditsky's Best Games
     "vEEsw5wy", # Daniel Naroditsky Speedrun Notes (Part 1)
     "mJnrrOEZ", # Sensei Speedrun Games
@@ -51,19 +51,18 @@ STUDY_IDS = [
 ]
 
 OUTPUT_FILE = "chess_coaching_data.jsonl"
-MIN_COMMENT_LENGTH = 20  # Filter out "lol", "blunder", etc.
-# ---------------------
+MIN_COMMENT_LENGTH = 20  # ignore noise
 
 def clean_comment(comment):
-    # Remove engine evals like [%eval 0.33] or [%clk 0:05:00]
+    # drop engine tags like [%eval ...]
     comment = re.sub(r"\[%.*?\]", "", comment)
-    # Remove multiple spaces/newlines
+    # squeeze whitespace
     comment = " ".join(comment.split())
     return comment
 
 def process_study(study_id):
     print(f"Downloading Study: {study_id}...")
-    # Lichess API to export all chapters of a study as one big PGN
+    # lichess export
     url = f"https://lichess.org/study/{study_id}.pgn"
     response = requests.get(url)
     
@@ -77,27 +76,27 @@ def process_study(study_id):
     while True:
         game = chess.pgn.read_game(pgn_data)
         if game is None:
-            break  # End of file
+            break
 
         board = game.board()
         
-        # Iterate through every move in the game
+        # walk every move
         for node in game.mainline():
             comment = node.comment.strip()
             
-            # THE FILTER: Only keep if it has a real text comment
+            # keep only real text
             if comment:
                 clean_text = clean_comment(comment)
                 
-                # Check if it's long enough to be useful
+                # skip short blurbs
                 if len(clean_text) > MIN_COMMENT_LENGTH:
                     entry = {
-                        "input": board.fen(), # The Board State
-                        "output": clean_text  # The Coach's explanation
+                        "input": board.fen(),
+                        "output": clean_text
                     }
                     data_pairs.append(entry)
             
-            # Apply the move to update the board for the next loop
+            # advance board
             board.push(node.move)
             
     return data_pairs
@@ -110,7 +109,7 @@ def main():
         all_data.extend(data)
         print(f" -> Found {len(data)} valid training examples.")
 
-    # Save to JSONL
+    # write jsonl
     print(f"\nSaving {len(all_data)} total examples to {OUTPUT_FILE}...")
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         for entry in all_data:
