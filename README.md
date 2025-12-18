@@ -1,4 +1,6 @@
 # Chess Review MVP: React UI + FastAPI backend
+[![Video 1](https://img.youtube.com/vi/-fTXBCEjlBk/maxresdefault.jpg)](https://www.youtube.com/watch?v=-fTXBCEjlBk)
+[![Video 2](https://img.youtube.com/vi/xG9A5_v8L4Y/maxresdefault.jpg)](https://www.youtube.com/watch?v=xG9A5_v8L4Y)
 
 
 ## Backend (FastAPI)
